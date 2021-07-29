@@ -21,6 +21,9 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <arrow/io/api.h>
+
+#include "arrow/filesystem/filesystem.h"
 
 #include "arrow/io/caching.h"
 #include "arrow/util/type_fwd.h"
@@ -88,6 +91,12 @@ class PARQUET_EXPORT ParquetFileReader {
         const ReaderProperties& props = default_reader_properties(),
         std::shared_ptr<FileMetaData> metadata = NULLPTR);
 
+    static std::unique_ptr<Contents> Open(
+        std::shared_ptr<::arrow::io::RandomAccessFile> source,
+        std::shared_ptr<::arrow::io::FileSystem> fs,
+        const ReaderProperties& props = default_reader_properties(),
+        std::shared_ptr<FileMetaData> metadata = NULLPTR);
+
     static ::arrow::Future<std::unique_ptr<Contents>> OpenAsync(
         std::shared_ptr<::arrow::io::RandomAccessFile> source,
         const ReaderProperties& props = default_reader_properties(),
@@ -107,6 +116,12 @@ class PARQUET_EXPORT ParquetFileReader {
   // the responsibility of the file implementation
   static std::unique_ptr<ParquetFileReader> Open(
       std::shared_ptr<::arrow::io::RandomAccessFile> source,
+      const ReaderProperties& props = default_reader_properties(),
+      std::shared_ptr<FileMetaData> metadata = NULLPTR);
+
+  static std::unique_ptr<ParquetFileReader> Open(
+      std::shared_ptr<::arrow::io::RandomAccessFile> source,
+      std::shared_ptr<::arrow::io::FileSystem> fs,
       const ReaderProperties& props = default_reader_properties(),
       std::shared_ptr<FileMetaData> metadata = NULLPTR);
 

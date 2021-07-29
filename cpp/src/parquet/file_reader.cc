@@ -146,6 +146,7 @@ const RowGroupMetaData* RowGroupReader::metadata() const { return contents_->met
 
   int64_t col_length = column_metadata->total_compressed_size();
   int64_t col_end;
+  // TODO: is this validation invalid?
   if (AddWithOverflow(col_start, col_length, &col_end) || col_end > source_size) {
     throw ParquetException("Invalid column metadata (corrupt file?)");
   }
@@ -167,6 +168,7 @@ const RowGroupMetaData* RowGroupReader::metadata() const { return contents_->met
 // RowGroupReader::Contents implementation for the Parquet file specification
 class SerializedRowGroup : public RowGroupReader::Contents {
  public:
+  // TODO: pass in multiple sources - map of column ID to source?
   SerializedRowGroup(std::shared_ptr<ArrowInputFile> source,
                      std::shared_ptr<::arrow::io::internal::ReadRangeCache> cached_source,
                      int64_t source_size, FileMetaData* file_metadata,
@@ -187,6 +189,8 @@ class SerializedRowGroup : public RowGroupReader::Contents {
   const ReaderProperties* properties() const override { return &properties_; }
 
   std::unique_ptr<PageReader> GetColumnPageReader(int i) override {
+    // TODO: need to open appropriate file
+
     // Read column chunk from the file
     auto col = row_group_metadata_->ColumnChunk(i);
 
@@ -297,10 +301,14 @@ class SerializedFile : public ParquetFileReader::Contents {
     file_metadata_ = std::move(metadata);
   }
 
+  void InitExternalSources(const std::vector<int>& row_groups,
+                           const std::vector<int>& column_indices,
+
   void PreBuffer(const std::vector<int>& row_groups,
                  const std::vector<int>& column_indices,
                  const ::arrow::io::IOContext& ctx,
                  const ::arrow::io::CacheOptions& options) {
+    // TODO: build up map, constructing additional sources as needed
     cached_source_ =
         std::make_shared<::arrow::io::internal::ReadRangeCache>(source_, ctx, options);
     std::vector<::arrow::io::ReadRange> ranges;
@@ -506,6 +514,8 @@ class SerializedFile : public ParquetFileReader::Contents {
 
  private:
   std::shared_ptr<ArrowInputFile> source_;
+  std::shared_ptr<::arrow::io::FileSystem> fs_; // OPTIONAL, used to open alternate files
+
   std::shared_ptr<::arrow::io::internal::ReadRangeCache> cached_source_;
   int64_t source_size_;
   std::shared_ptr<FileMetaData> file_metadata_;
@@ -685,6 +695,29 @@ std::unique_ptr<ParquetFileReader::Contents> ParquetFileReader::Contents::Open(
   return result;
 }
 
+// Open the file. If no metadata is passed, it is parsed from the footer of
+// the file
+std::unique_ptr<ParquetFileReader::Contents> ParquetFileReader::Contents::Open(
+    std::shared_ptr<ArrowInputFile> source,
+std::shared_ptr<::arrow::io::FileSystem> fs,
+    const ReaderProperties& props,
+    std::shared_ptr<FileMetaData> metadata) {
+  std::unique_ptr<ParquetFileReader::Contents> result(
+      new SerializedFile(std::move(source), std::move(fs), props));
+
+  // Access private methods here, but otherwise unavailable
+  SerializedFile* file = static_cast<SerializedFile*>(result.get());
+
+  if (metadata == nullptr) {
+    // Validates magic bytes, parses metadata, and initializes the SchemaDescriptor
+    file->ParseMetaData();
+  } else {
+    file->set_metadata(std::move(metadata));
+  }
+
+  return result;
+}
+
 ::arrow::Future<std::unique_ptr<ParquetFileReader::Contents>>
 ParquetFileReader::Contents::OpenAsync(std::shared_ptr<ArrowInputFile> source,
                                        const ReaderProperties& props,
@@ -720,6 +753,20 @@ std::unique_ptr<ParquetFileReader> ParquetFileReader::Open(
   result->Open(std::move(contents));
   return result;
 }
+
+
+
+std::unique_ptr<ParquetFileReader> ParquetFileReader::Open(
+       std::shared_ptr<::arrow::io::RandomAccessFile> source,
+      std::shared_ptr<::arrow::io::FileSystem> fs,
+       const ReaderProperties& props,
+       std::shared_ptr<FileMetaData> metadata) {
+   auto contents = SerializedFile::Open(std::move(source),
+          std::move(fs), props, std::move(metadata));
+   std::unique_ptr<ParquetFileReader> result(new ParquetFileReader());
+   result->Open(std::move(contents));
+   return result;
+ }
 
 std::unique_ptr<ParquetFileReader> ParquetFileReader::OpenFile(
     const std::string& path, bool memory_map, const ReaderProperties& props,

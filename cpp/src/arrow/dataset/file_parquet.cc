@@ -809,7 +809,7 @@ static inline Result<std::string> FileFromRowGroup(
         "The column chunks' file paths should be set, but got an empty file path.");
   }
 
-  if (validate_column_chunk_paths) {
+  if (false && validate_column_chunk_paths) {
     for (int i = 1; i < row_group.num_columns(); ++i) {
       const auto& column_path = row_group.ColumnChunk(i)->file_path();
       if (column_path != path) {
