@@ -49,6 +49,8 @@ using arrow::internal::AddWithOverflow;
 
 namespace parquet {
 
+static const std::string BASE_DIR_FIX_ME = "/fix/me";
+
 // PARQUET-978: Minimize footer reads by reading 64 KB from the end of the file
 static constexpr int64_t kDefaultFooterReadSize = 64 * 1024;
 static constexpr uint32_t kFooterSize = 8;
@@ -276,7 +278,12 @@ class SerializedFile : public ParquetFileReader::Contents {
       : source_(std::move(source)), properties_(props) {
     PARQUET_ASSIGN_OR_THROW(source_size_, source_->GetSize());
   }
-
+  SerializedFile(std::shared_ptr<ArrowInputFile> source,
+        std::shared_ptr<::arrow::fs::FileSystem> fs,
+                 const ReaderProperties& props = default_reader_properties())
+      : source_(std::move(source)), fs_(std::move(fs)), properties_(props) {
+    PARQUET_ASSIGN_OR_THROW(source_size_, source_->GetSize());
+  }
   ~SerializedFile() override {
     try {
       Close();
@@ -301,24 +308,88 @@ class SerializedFile : public ParquetFileReader::Contents {
     file_metadata_ = std::move(metadata);
   }
 
-  void InitExternalSources(const std::vector<int>& row_groups,
-                           const std::vector<int>& column_indices,
+  void InitExternalFiles(const std::vector<int>& row_groups,
+                           const std::vector<int>& column_indices) {
+    if (!ext_files_.empty()) return;
+    if (cached_source_ != nullptr) {
+      throw ::parquet::ParquetStatusException(
+          ::arrow::Status(::arrow::StatusCode::Invalid,
+              "Must call InitExternalFiles() before Prebuffer()"));
+    }
+
+    for (int row_group_idx : row_groups) {
+      for (int col_idx : column_indices) {
+        auto column_metadata = file_metadata_->RowGroup(row_group_idx)->ColumnChunk(col_idx);
+        // TODO: distinguish not set vs empty string? Does it matter?
+        auto path = column_metadata->file_path();
+        if (!path.empty()) {
+          if (fs_ == nullptr) {
+            throw ::parquet::ParquetStatusException(
+                ::arrow::Status(::arrow::StatusCode::Invalid,
+                    "External chunk " + path + " but not initialised with filesystem"));
+          }
+          if (ext_files_.find(path) == ext_files_.end()) {
+            auto file = fs_->OpenInputFile(BASE_DIR_FIX_ME + "/" + path);
+            if (!file.ok()) {
+              throw ::parquet::ParquetStatusException(std::move(file.status()));
+            }
+            ext_files_.emplace(path, file.MoveValueUnsafe());
+          }
+        }
+      }
+    }
+  }
+
+  std::pair<std::vector<::arrow::io::ReadRange>,
+            std::map<std::string, std::vector<::arrow::io::ReadRange>>>
+            FindRanges(const std::vector<int>& row_groups,
+                       const std::vector<int>& column_indices) const {
+    std::vector<::arrow::io::ReadRange> same_file_ranges;
+    // Use sorted map for determinism.
+    std::map<std::string, std::vector<::arrow::io::ReadRange>> ext_file_ranges;
+    for (int row : row_groups) {
+      for (int col : column_indices) {
+        auto column_metadata = file_metadata_->RowGroup(row)->ColumnChunk(col);
+        // TODO: distinguish not set vs empty string? Does it matter?
+        auto path = column_metadata->file_path();
+        if (path == "") {
+          same_file_ranges.push_back(
+                      ComputeColumnChunkRange(file_metadata_.get(), source_size_, row, col));
+        } else {
+          ext_file_ranges[path].push_back(ComputeColumnChunkRange(file_metadata_.get(),
+                           std::numeric_limits<int64_t>::max(), row, col));
+        }
+      }
+    }
+    return std::make_pair(std::move(same_file_ranges), std::move(ext_file_ranges));
+  }
 
   void PreBuffer(const std::vector<int>& row_groups,
                  const std::vector<int>& column_indices,
                  const ::arrow::io::IOContext& ctx,
                  const ::arrow::io::CacheOptions& options) {
-    // TODO: build up map, constructing additional sources as needed
+    auto range_pair = FindRanges(row_groups, column_indices);
+    const auto& same_file_ranges = range_pair.first;
+    const auto& ext_file_ranges = range_pair.second;
+
     cached_source_ =
         std::make_shared<::arrow::io::internal::ReadRangeCache>(source_, ctx, options);
-    std::vector<::arrow::io::ReadRange> ranges;
-    for (int row : row_groups) {
-      for (int col : column_indices) {
-        ranges.push_back(
-            ComputeColumnChunkRange(file_metadata_.get(), source_size_, row, col));
+    PARQUET_THROW_NOT_OK(cached_source_->Cache(same_file_ranges));
+
+    for (const auto& e : ext_file_ranges) {
+      auto ext_it = ext_files_.find(e.first);
+      if (ext_it == ext_files_.end()) {
+        throw ::parquet::ParquetStatusException(
+            ::arrow::Status(::arrow::StatusCode::Invalid,
+                "Must call InitExternalFiles() before Prebuffer()"));
       }
+      auto cached_it = cached_ext_files_.find(e.first);
+      if (cached_it == cached_ext_files_.end()) {
+        cached_it = cached_ext_files_.emplace(e.first,
+            std::make_shared<::arrow::io::internal::ReadRangeCache>(ext_it->second, ctx, options)).first;
+      }
+      PARQUET_THROW_NOT_OK(cached_it->second->Cache(e.second));
     }
-    PARQUET_THROW_NOT_OK(cached_source_->Cache(ranges));
   }
 
   ::arrow::Future<> WhenBuffered(const std::vector<int>& row_groups,
@@ -326,14 +397,25 @@ class SerializedFile : public ParquetFileReader::Contents {
     if (!cached_source_) {
       return ::arrow::Status::Invalid("Must call PreBuffer before WhenBuffered");
     }
-    std::vector<::arrow::io::ReadRange> ranges;
-    for (int row : row_groups) {
-      for (int col : column_indices) {
-        ranges.push_back(
-            ComputeColumnChunkRange(file_metadata_.get(), source_size_, row, col));
-      }
+
+    auto range_pair = FindRanges(row_groups, column_indices);
+    const auto& same_file_ranges = range_pair.first;
+    const auto& ext_file_ranges = range_pair.second;
+
+    auto future = cached_source_->WaitFor(same_file_ranges);
+    if (ext_file_ranges.empty()) {
+      return future;
     }
-    return cached_source_->WaitFor(ranges);
+    std::vector<::arrow::Future<>> futures;
+    futures.push_back(future);
+    for (const auto& e : ext_file_ranges) {
+      auto it = cached_ext_files_.find(e.first);
+      if (it == cached_ext_files_.end()) {
+        return ::arrow::Status::Invalid("Must call PreBuffer for all row groups and columns before WhenBuffered");
+      }
+      futures.push_back(it->second->WaitFor(e.second));
+    }
+    return static_cast<::arrow::Future<>>(::arrow::All<>(futures));
   }
 
   // Metadata/footer parsing. Divided up to separate sync/async paths, and to use
@@ -514,9 +596,15 @@ class SerializedFile : public ParquetFileReader::Contents {
 
  private:
   std::shared_ptr<ArrowInputFile> source_;
-  std::shared_ptr<::arrow::io::FileSystem> fs_; // OPTIONAL, used to open alternate files
+  std::shared_ptr<::arrow::fs::FileSystem> fs_; // OPTIONAL, used to open alternate files
 
   std::shared_ptr<::arrow::io::internal::ReadRangeCache> cached_source_;
+
+  // TODO: this is making class bigger. Problem?
+  std::unordered_map<std::string, std::shared_ptr<::arrow::io::RandomAccessFile>> ext_files_;
+  std::unordered_map<std::string, std::shared_ptr<::arrow::io::internal::ReadRangeCache>> cached_ext_files_;
+
+
   int64_t source_size_;
   std::shared_ptr<FileMetaData> file_metadata_;
   ReaderProperties properties_;
@@ -699,7 +787,7 @@ std::unique_ptr<ParquetFileReader::Contents> ParquetFileReader::Contents::Open(
 // the file
 std::unique_ptr<ParquetFileReader::Contents> ParquetFileReader::Contents::Open(
     std::shared_ptr<ArrowInputFile> source,
-std::shared_ptr<::arrow::io::FileSystem> fs,
+std::shared_ptr<::arrow::fs::FileSystem> fs,
     const ReaderProperties& props,
     std::shared_ptr<FileMetaData> metadata) {
   std::unique_ptr<ParquetFileReader::Contents> result(
@@ -758,7 +846,7 @@ std::unique_ptr<ParquetFileReader> ParquetFileReader::Open(
 
 std::unique_ptr<ParquetFileReader> ParquetFileReader::Open(
        std::shared_ptr<::arrow::io::RandomAccessFile> source,
-      std::shared_ptr<::arrow::io::FileSystem> fs,
+      std::shared_ptr<::arrow::fs::FileSystem> fs,
        const ReaderProperties& props,
        std::shared_ptr<FileMetaData> metadata) {
    auto contents = SerializedFile::Open(std::move(source),

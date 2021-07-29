@@ -93,7 +93,7 @@ class PARQUET_EXPORT ParquetFileReader {
 
     static std::unique_ptr<Contents> Open(
         std::shared_ptr<::arrow::io::RandomAccessFile> source,
-        std::shared_ptr<::arrow::io::FileSystem> fs,
+        std::shared_ptr<::arrow::fs::FileSystem> fs,
         const ReaderProperties& props = default_reader_properties(),
         std::shared_ptr<FileMetaData> metadata = NULLPTR);
 
@@ -121,7 +121,7 @@ class PARQUET_EXPORT ParquetFileReader {
 
   static std::unique_ptr<ParquetFileReader> Open(
       std::shared_ptr<::arrow::io::RandomAccessFile> source,
-      std::shared_ptr<::arrow::io::FileSystem> fs,
+      std::shared_ptr<::arrow::fs::FileSystem> fs,
       const ReaderProperties& props = default_reader_properties(),
       std::shared_ptr<FileMetaData> metadata = NULLPTR);
 
