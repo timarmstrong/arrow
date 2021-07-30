@@ -100,6 +100,7 @@ void ParquetFilePrinter::DebugPrint(std::ostream& stream, std::list<int> selecte
     stream << ")" << std::endl;
   }
 
+  // TODO: this is the caller
   for (int r = 0; r < file_metadata->num_row_groups(); ++r) {
     stream << "--- Row Group: " << r << " ---\n";
 

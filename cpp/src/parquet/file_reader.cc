@@ -49,7 +49,7 @@ using arrow::internal::AddWithOverflow;
 
 namespace parquet {
 
-static const std::string BASE_DIR_FIX_ME = "/fix/me";
+static const std::string BASE_DIR_FIX_ME = "/home/Tim.Armstrong/virtual-parquet-writer/data";
 
 // PARQUET-978: Minimize footer reads by reading 64 KB from the end of the file
 static constexpr int64_t kDefaultFooterReadSize = 64 * 1024;
@@ -170,12 +170,30 @@ const RowGroupMetaData* RowGroupReader::metadata() const { return contents_->met
   return {col_start, col_length};
 }
 
+
+static std::shared_ptr<::arrow::io::RandomAccessFile>& GetOrCreateExtFile(const std::string& path,
+                                                                          const ReaderProperties& props, ::arrow::fs::FileSystem* fs, std::shared_ptr<ExtFileMapType>& ext_files) {
+  if (ext_files == nullptr) ext_files = std::make_shared<ExtFileMapType>();
+  auto it = ext_files->find(path);
+  if (it == ext_files->end()) {
+    std::string full_path = BASE_DIR_FIX_ME + "/" + path;
+    auto file = fs != nullptr ? fs->OpenInputFile(full_path)
+        : ::arrow::io::ReadableFile::Open(full_path, props.memory_pool());
+    if (!file.ok()) {
+      throw ::parquet::ParquetStatusException(std::move(file.status()));
+    }
+    it = ext_files->emplace(path, file.MoveValueUnsafe()).first;
+  }
+  return it->second;
+}
+
 // RowGroupReader::Contents implementation for the Parquet file specification
 class SerializedRowGroup : public RowGroupReader::Contents {
  public:
   // TODO: pass in multiple sources - map of column ID to source?
   SerializedRowGroup(std::shared_ptr<ArrowInputFile> source,
                      std::shared_ptr<::arrow::io::internal::ReadRangeCache> cached_source,
+                     std::shared_ptr<::arrow::fs::FileSystem> fs,
                      std::shared_ptr<ExtFileMapType> ext_files,
                      std::shared_ptr<CachedExtFileMapType> cached_ext_files,
                      int64_t source_size, FileMetaData* file_metadata,
@@ -183,8 +201,9 @@ class SerializedRowGroup : public RowGroupReader::Contents {
                      std::shared_ptr<InternalFileDecryptor> file_decryptor = nullptr)
       : source_(std::move(source)),
         cached_source_(std::move(cached_source)),
+        fs_(std::move(fs)),
         ext_files_(std::move(ext_files)),
-        cached_ext_files(std::move(cached_ext_files)),
+        cached_ext_files_(std::move(cached_ext_files)),
         source_size_(source_size),
         file_metadata_(file_metadata),
         properties_(props),
@@ -204,22 +223,24 @@ class SerializedRowGroup : public RowGroupReader::Contents {
     auto col = row_group_metadata_->ColumnChunk(i);
 
     ::arrow::io::ReadRange col_range =
-        ComputeColumnChunkRange(file_metadata_, source_size_, row_group_ordinal_, i);
+        ComputeColumnChunkRange(file_metadata_, /*source_size_ HACK: disable validation*/ std::numeric_limits<int64_t>::max(), row_group_ordinal_, i);
     std::shared_ptr<ArrowInputStream> stream;
     if (cached_source_) {
       // PARQUET-1698: if read coalescing is enabled, read from pre-buffered
       // segments.
-      if (col.file_path.empty()) {
+      if (col->file_path().empty()) {
         PARQUET_ASSIGN_OR_THROW(auto buffer, cached_source_->Read(col_range));
         stream = std::make_shared<::arrow::io::BufferReader>(buffer);
       } else {
         // TODO
+
+        throw ParquetException("Cached read not implemented for external chunk: " + col->file_path());
       }
     } else {
-      if (col.file_path.empty()) {
+      if (col->file_path().empty()) {
         stream = properties_.GetStream(source_, col_range.offset, col_range.length);
       } else {
-        // TODO
+        stream = properties_.GetStream(GetOrCreateExtFile(col->file_path(), properties_, fs_.get(), ext_files_), col_range.offset, col_range.length);
       }
     }
 
@@ -272,6 +293,7 @@ class SerializedRowGroup : public RowGroupReader::Contents {
   std::shared_ptr<ArrowInputFile> source_;
   // Will be nullptr if PreBuffer() is not called.
   std::shared_ptr<::arrow::io::internal::ReadRangeCache> cached_source_;
+  std::shared_ptr<::arrow::fs::FileSystem> fs_; // OPTIONAL, used to open alternate files
 
   // nullptr unless there are external column chunks.
   std::shared_ptr<ExtFileMapType> ext_files_;
@@ -317,7 +339,7 @@ class SerializedFile : public ParquetFileReader::Contents {
 
   std::shared_ptr<RowGroupReader> GetRowGroup(int i) override {
     std::unique_ptr<SerializedRowGroup> contents(
-        new SerializedRowGroup(source_, cached_source_,
+        new SerializedRowGroup(source_, cached_source_, fs_,
             ext_files_, cached_ext_files_, source_size_,
                                file_metadata_.get(), i, properties_, file_decryptor_));
     return std::make_shared<RowGroupReader>(std::move(contents));
@@ -349,14 +371,7 @@ class SerializedFile : public ParquetFileReader::Contents {
                 ::arrow::Status(::arrow::StatusCode::Invalid,
                     "External chunk " + path + " but not initialised with filesystem"));
           }
-          if (ext_files_ == nullptr) ext_files_ = std::make_shared<ExtFileMapType>();
-          if (ext_files_->find(path) == ext_files_->end()) {
-            auto file = fs_->OpenInputFile(BASE_DIR_FIX_ME + "/" + path);
-            if (!file.ok()) {
-              throw ::parquet::ParquetStatusException(std::move(file.status()));
-            }
-            ext_files_->emplace(path, file.MoveValueUnsafe());
-          }
+          GetOrCreateExtFile(path, properties_, fs_.get(), ext_files_);
         }
       }
     }
