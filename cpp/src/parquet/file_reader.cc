@@ -58,6 +58,9 @@ static constexpr uint32_t kFooterSize = 8;
 // For PARQUET-816
 static constexpr int64_t kMaxDictHeaderSize = 100;
 
+using ExtFileMapType = std::unordered_map<std::string, std::shared_ptr<::arrow::io::RandomAccessFile>>;
+using CachedExtFileMapType = std::unordered_map<std::string, std::shared_ptr<::arrow::io::internal::ReadRangeCache>>;
+
 // ----------------------------------------------------------------------
 // RowGroupReader public API
 
@@ -173,11 +176,15 @@ class SerializedRowGroup : public RowGroupReader::Contents {
   // TODO: pass in multiple sources - map of column ID to source?
   SerializedRowGroup(std::shared_ptr<ArrowInputFile> source,
                      std::shared_ptr<::arrow::io::internal::ReadRangeCache> cached_source,
+                     std::shared_ptr<ExtFileMapType> ext_files,
+                     std::shared_ptr<CachedExtFileMapType> cached_ext_files,
                      int64_t source_size, FileMetaData* file_metadata,
                      int row_group_number, const ReaderProperties& props,
                      std::shared_ptr<InternalFileDecryptor> file_decryptor = nullptr)
       : source_(std::move(source)),
         cached_source_(std::move(cached_source)),
+        ext_files_(std::move(ext_files)),
+        cached_ext_files(std::move(cached_ext_files)),
         source_size_(source_size),
         file_metadata_(file_metadata),
         properties_(props),
@@ -202,10 +209,18 @@ class SerializedRowGroup : public RowGroupReader::Contents {
     if (cached_source_) {
       // PARQUET-1698: if read coalescing is enabled, read from pre-buffered
       // segments.
-      PARQUET_ASSIGN_OR_THROW(auto buffer, cached_source_->Read(col_range));
-      stream = std::make_shared<::arrow::io::BufferReader>(buffer);
+      if (col.file_path.empty()) {
+        PARQUET_ASSIGN_OR_THROW(auto buffer, cached_source_->Read(col_range));
+        stream = std::make_shared<::arrow::io::BufferReader>(buffer);
+      } else {
+        // TODO
+      }
     } else {
-      stream = properties_.GetStream(source_, col_range.offset, col_range.length);
+      if (col.file_path.empty()) {
+        stream = properties_.GetStream(source_, col_range.offset, col_range.length);
+      } else {
+        // TODO
+      }
     }
 
     std::unique_ptr<ColumnCryptoMetaData> crypto_metadata = col->crypto_metadata();
@@ -257,6 +272,11 @@ class SerializedRowGroup : public RowGroupReader::Contents {
   std::shared_ptr<ArrowInputFile> source_;
   // Will be nullptr if PreBuffer() is not called.
   std::shared_ptr<::arrow::io::internal::ReadRangeCache> cached_source_;
+
+  // nullptr unless there are external column chunks.
+  std::shared_ptr<ExtFileMapType> ext_files_;
+  std::shared_ptr<CachedExtFileMapType> cached_ext_files_;
+
   int64_t source_size_;
   FileMetaData* file_metadata_;
   std::unique_ptr<RowGroupMetaData> row_group_metadata_;
@@ -297,7 +317,8 @@ class SerializedFile : public ParquetFileReader::Contents {
 
   std::shared_ptr<RowGroupReader> GetRowGroup(int i) override {
     std::unique_ptr<SerializedRowGroup> contents(
-        new SerializedRowGroup(source_, cached_source_, source_size_,
+        new SerializedRowGroup(source_, cached_source_,
+            ext_files_, cached_ext_files_, source_size_,
                                file_metadata_.get(), i, properties_, file_decryptor_));
     return std::make_shared<RowGroupReader>(std::move(contents));
   }
@@ -310,7 +331,7 @@ class SerializedFile : public ParquetFileReader::Contents {
 
   void InitExternalFiles(const std::vector<int>& row_groups,
                            const std::vector<int>& column_indices) {
-    if (!ext_files_.empty()) return;
+    if (ext_files_ != nullptr) return;
     if (cached_source_ != nullptr) {
       throw ::parquet::ParquetStatusException(
           ::arrow::Status(::arrow::StatusCode::Invalid,
@@ -328,12 +349,13 @@ class SerializedFile : public ParquetFileReader::Contents {
                 ::arrow::Status(::arrow::StatusCode::Invalid,
                     "External chunk " + path + " but not initialised with filesystem"));
           }
-          if (ext_files_.find(path) == ext_files_.end()) {
+          if (ext_files_ == nullptr) ext_files_ = std::make_shared<ExtFileMapType>();
+          if (ext_files_->find(path) == ext_files_->end()) {
             auto file = fs_->OpenInputFile(BASE_DIR_FIX_ME + "/" + path);
             if (!file.ok()) {
               throw ::parquet::ParquetStatusException(std::move(file.status()));
             }
-            ext_files_.emplace(path, file.MoveValueUnsafe());
+            ext_files_->emplace(path, file.MoveValueUnsafe());
           }
         }
       }
@@ -377,15 +399,21 @@ class SerializedFile : public ParquetFileReader::Contents {
     PARQUET_THROW_NOT_OK(cached_source_->Cache(same_file_ranges));
 
     for (const auto& e : ext_file_ranges) {
-      auto ext_it = ext_files_.find(e.first);
-      if (ext_it == ext_files_.end()) {
+      if (ext_files_ == nullptr) {
         throw ::parquet::ParquetStatusException(
             ::arrow::Status(::arrow::StatusCode::Invalid,
                 "Must call InitExternalFiles() before Prebuffer()"));
       }
-      auto cached_it = cached_ext_files_.find(e.first);
-      if (cached_it == cached_ext_files_.end()) {
-        cached_it = cached_ext_files_.emplace(e.first,
+      auto ext_it = ext_files_->find(e.first);
+      if (ext_it == ext_files_->end()) {
+        throw ::parquet::ParquetStatusException(
+            ::arrow::Status(::arrow::StatusCode::Invalid,
+                "Must call InitExternalFiles() before Prebuffer()"));
+      }
+      if (cached_ext_files_ == nullptr) cached_ext_files_ = std::make_shared<CachedExtFileMapType>();
+      auto cached_it = cached_ext_files_->find(e.first);
+      if (cached_it == cached_ext_files_->end()) {
+        cached_it = cached_ext_files_->emplace(e.first,
             std::make_shared<::arrow::io::internal::ReadRangeCache>(ext_it->second, ctx, options)).first;
       }
       PARQUET_THROW_NOT_OK(cached_it->second->Cache(e.second));
@@ -409,8 +437,11 @@ class SerializedFile : public ParquetFileReader::Contents {
     std::vector<::arrow::Future<>> futures;
     futures.push_back(future);
     for (const auto& e : ext_file_ranges) {
-      auto it = cached_ext_files_.find(e.first);
-      if (it == cached_ext_files_.end()) {
+      if (!cached_ext_files_) {
+        return ::arrow::Status::Invalid("Must call PreBuffer before WhenBuffered");
+      }
+      auto it = cached_ext_files_->find(e.first);
+      if (it == cached_ext_files_->end()) {
         return ::arrow::Status::Invalid("Must call PreBuffer for all row groups and columns before WhenBuffered");
       }
       futures.push_back(it->second->WaitFor(e.second));
@@ -600,10 +631,9 @@ class SerializedFile : public ParquetFileReader::Contents {
 
   std::shared_ptr<::arrow::io::internal::ReadRangeCache> cached_source_;
 
-  // TODO: this is making class bigger. Problem?
-  std::unordered_map<std::string, std::shared_ptr<::arrow::io::RandomAccessFile>> ext_files_;
-  std::unordered_map<std::string, std::shared_ptr<::arrow::io::internal::ReadRangeCache>> cached_ext_files_;
-
+  // Used when there are external column chunks.
+  std::shared_ptr<ExtFileMapType> ext_files_;
+  std::shared_ptr<CachedExtFileMapType> cached_ext_files_;
 
   int64_t source_size_;
   std::shared_ptr<FileMetaData> file_metadata_;
@@ -856,6 +886,7 @@ std::unique_ptr<ParquetFileReader> ParquetFileReader::Open(
    return result;
  }
 
+ // TODO: would need to support this too (have a way to mark that it's the local filesystem??)
 std::unique_ptr<ParquetFileReader> ParquetFileReader::OpenFile(
     const std::string& path, bool memory_map, const ReaderProperties& props,
     std::shared_ptr<FileMetaData> metadata) {
@@ -871,6 +902,7 @@ std::unique_ptr<ParquetFileReader> ParquetFileReader::OpenFile(
   return Open(std::move(source), props, std::move(metadata));
 }
 
+// TODO: would need to support this too (have a way to mark that it's the local filesystem??)
 ::arrow::Future<std::unique_ptr<ParquetFileReader>> ParquetFileReader::OpenAsync(
     std::shared_ptr<::arrow::io::RandomAccessFile> source, const ReaderProperties& props,
     std::shared_ptr<FileMetaData> metadata) {
